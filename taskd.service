@@ -1,0 +1,17 @@
+[Unit]
+Description=Task Runner Daemon (taskd)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/nikos/.zeroclaw/taskd/taskd.py start
+Restart=on-failure
+RestartSec=10
+WorkingDirectory=/home/nikos/.zeroclaw/taskd
+User=nikos
+Environment=TASKD_DIR=/home/nikos/.zeroclaw/taskd
+Environment=TASKD_PORT=9100
+
+[Install]
+WantedBy=multi-user.target
