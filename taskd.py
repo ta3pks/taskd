@@ -62,6 +62,7 @@ STALL_TIMEOUT = 600  # seconds of no log output before considering task stalled
 NOTIFY_CHANNEL = os.environ.get("TASKD_NOTIFY_CHANNEL", "telegram")
 NOTIFY_RECIPIENT = os.environ.get("TASKD_NOTIFY_RECIPIENT", "")
 DEFAULT_MEDIA_DIR = Path("/media/media")
+CLAUDE_BRIDGE_DIR = Path.home() / ".zeroclaw/workspace/claude-code-bridge"
 
 # Video extensions to count for progress
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".webm", ".ts"}
@@ -69,6 +70,7 @@ VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".webm", ".ts"}
 # Ensure dirs exist
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+CLAUDE_BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class TaskStatus(str, Enum):
@@ -308,13 +310,10 @@ class TaskRunner:
             return None
 
     def _build_claude(self, task: Task) -> list[str]:
-        """Build Claude Code task. Args are the prompt text (joined with spaces).
-        Writes prompt to bridge input, runs claude, captures output."""
+        """Build Claude Code task. Args are the prompt text (joined with spaces)."""
         prompt = " ".join(task.args) if task.args else task.name
-        bridge_dir = Path.home() / ".zeroclaw/workspace/claude-code-bridge"
-        bridge_dir.mkdir(parents=True, exist_ok=True)
-        input_file = bridge_dir / "input.md"
-        output_file = bridge_dir / "output.md"
+        input_file = CLAUDE_BRIDGE_DIR / "input.md"
+        output_file = CLAUDE_BRIDGE_DIR / "output.md"
         input_file.write_text(prompt)
         return [
             "bash", "-c",
