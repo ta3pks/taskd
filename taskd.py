@@ -43,6 +43,7 @@ import socketserver
 import shutil
 import re
 import shlex
+import urllib.request
 import glob as globmod
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,8 +60,8 @@ HTTP_PORT = int(os.environ.get("TASKD_PORT", 9100))
 POLL_INTERVAL = 5  # seconds between process checks
 MAX_CONCURRENT = 2  # max simultaneous tasks
 STALL_TIMEOUT = 600  # seconds of no log output before considering task stalled
-NOTIFY_CHANNEL = os.environ.get("TASKD_NOTIFY_CHANNEL", "telegram")
-NOTIFY_RECIPIENT = os.environ.get("TASKD_NOTIFY_RECIPIENT", "")
+NOTIFY_TG_TOKEN = os.environ.get("TASKD_TG_BOT_TOKEN", "")
+NOTIFY_TG_CHAT = os.environ.get("TASKD_TG_CHAT_ID", "")
 DEFAULT_MEDIA_DIR = Path("/media/media")
 CLAUDE_BRIDGE_DIR = Path.home() / ".zeroclaw/workspace/claude-code-bridge"
 
@@ -283,21 +284,37 @@ class TaskRunner:
             return False
 
     def _notify(self, task: Task, status: str):
-        """Send notification via zeroclaw channel when a task completes or fails"""
-        if not NOTIFY_RECIPIENT:
+        """Send task result to Telegram and trigger Natasha via webhook"""
+        if not NOTIFY_TG_TOKEN or not NOTIFY_TG_CHAT:
             return
         icon = "✅" if status == "completed" else "❌"
-        msg = f"{icon} taskd: '{task.name}' {status}"
-        try:
-            subprocess.Popen(
-                ["zeroclaw", "channel", "send", msg,
-                 "--channel-id", NOTIFY_CHANNEL, "--recipient", NOTIFY_RECIPIENT],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
-        except Exception:
-            pass  # notification is best-effort
+
+        # For claude tasks, send the output directly to Telegram
+        if task.type == "claude" and status == "completed":
+            output_file = CLAUDE_BRIDGE_DIR / "output.md"
+            try:
+                result = output_file.read_text().strip()
+                tg_msg = f"{icon} *Claude Code: {task.name}*\n\n{result}"
+            except Exception:
+                tg_msg = f"{icon} taskd: '{task.name}' {status} (couldn't read output)"
+        else:
+            tg_msg = f"{icon} taskd: '{task.name}' {status}"
+
+        # Send directly via Telegram Bot API
+        if NOTIFY_TG_TOKEN and NOTIFY_TG_CHAT:
+            try:
+                req = urllib.request.Request(
+                    f"https://api.telegram.org/bot{NOTIFY_TG_TOKEN}/sendMessage",
+                    data=json.dumps({
+                        "chat_id": NOTIFY_TG_CHAT,
+                        "text": tg_msg[:4096],
+                        "parse_mode": "Markdown",
+                    }).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                urllib.request.urlopen(req, timeout=10)
+            except Exception:
+                pass
 
     def _build_command(self, task: Task) -> Optional[list[str]]:
         if task.type == "ani-cli":
