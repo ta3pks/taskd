@@ -20,6 +20,7 @@ stepsCompleted: [requirements]
 - FR4: Purge must clean up per-task bridge directories
 - FR5: Existing ani-cli and shell task types must not break
 - FR6: State.json must be backward-compatible (new fields default gracefully)
+- FR7: Stall detector must check process liveness, not just log output
 
 ### Non-Functional Requirements
 - NFR1: Single Python file (no new dependencies)
@@ -61,7 +62,16 @@ stepsCompleted: [requirements]
 - [ ] Non-claude tasks purge behavior unchanged
 - [ ] Missing directories don't cause errors
 
-### Story 1.4: Update SKILL.md with new output path pattern
+### Story 1.4: Stall detector checks process liveness
+**As** an operator, **I want** the stall detector to check if the process is still alive **so that** silent tasks (no log output) aren't falsely marked as stalled.
+
+**Acceptance Criteria:**
+- [ ] Stall check first verifies if PID is still running (`os.kill(pid, 0)`)
+- [ ] If process is dead + no recent log output → mark stalled
+- [ ] If process is alive + no recent log output → don't mark stalled (just quiet)
+- [ ] Completed tasks with no output are never marked stalled
+
+### Story 1.5: Update SKILL.md with new output path pattern
 **As** Natasha, **I want** the skill documentation to reflect per-task output paths **so that** I read results from the correct location.
 
 **Acceptance Criteria:**
@@ -139,10 +149,11 @@ stepsCompleted: [requirements]
 1. Story 1.1 (per-task dirs) — core change, everything else depends on it
 2. Story 1.2 (notification path) — small follow-up
 3. Story 1.3 (purge cleanup) — keeps disk tidy
-4. Story 2.1 (submitter field) — data model change
-5. Story 2.2 (CLI flag) — user-facing
-6. Story 2.3 (notification submitter) — final touch
-7. Story 3.1 (routing config) — depends on submitter field
-8. Story 3.2 (route by submitter) — core routing logic
-9. Story 3.3 (webhook per agent) — optional, do when needed
-10. Story 1.4 (SKILL.md update) — documentation, do last
+4. Story 1.4 (stall detector fix) — reliability
+5. Story 2.1 (submitter field) — data model change
+6. Story 2.2 (CLI flag) — user-facing
+7. Story 2.3 (notification submitter) — final touch
+8. Story 3.1 (routing config) — depends on submitter field
+9. Story 3.2 (route by submitter) — core routing logic
+10. Story 3.3 (webhook per agent) — optional, do when needed
+11. Story 1.5 (SKILL.md update) — documentation, do last

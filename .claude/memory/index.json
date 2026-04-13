@@ -1,0 +1,19 @@
+{
+  "version": "1.0.0",
+  "lastUpdated": "2026-04-13T21:56:38.351Z",
+  "memories": [
+    {
+      "id": "decision-taskd-v2-architecture",
+      "type": "decision",
+      "title": "taskd v2 architecture",
+      "tags": [
+        "promoted-from-think",
+        "project"
+      ],
+      "created": "2026-04-13T21:56:38.333Z",
+      "updated": "2026-04-13T21:56:38.333Z",
+      "scope": "project",
+      "relativePath": "permanent/decision-taskd-v2-architecture.md"
+    }
+  ]
+}

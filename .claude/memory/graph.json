@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "nodes": [
+    {
+      "id": "decision-taskd-v2-architecture",
+      "type": "decision",
+      "title": "taskd v2 architecture",
+      "scope": "project"
+    }
+  ],
+  "edges": []
+}
