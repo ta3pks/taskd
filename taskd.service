@@ -12,6 +12,8 @@ WorkingDirectory=/home/nikos/.zeroclaw/taskd
 User=nikos
 Environment=TASKD_DIR=/home/nikos/.zeroclaw/taskd
 Environment=TASKD_PORT=9100
+Environment=TASKD_NOTIFY_CHANNEL=telegram
+Environment=TASKD_NOTIFY_RECIPIENT=REPLACE_WITH_CHAT_ID
 
 [Install]
 WantedBy=multi-user.target

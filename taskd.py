@@ -18,6 +18,9 @@ Usage:
 Task types:
     ani-cli:  ani-cli anime downloads (args: "Anime Name" -S <n> -e "1-12")
               --dub is ALWAYS added automatically
+    claude:   delegate to Claude Code (args: the prompt text)
+              e.g. taskd add claude "Weather check" What is the weather in Tbilisi tomorrow?
+              Handles bridge files, permissions, and output capture automatically.
     shell:    arbitrary shell command (args: everything after name)
 
 Progress tracking:
@@ -39,6 +42,7 @@ import http.server
 import socketserver
 import shutil
 import re
+import shlex
 import glob as globmod
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +59,8 @@ HTTP_PORT = int(os.environ.get("TASKD_PORT", 9100))
 POLL_INTERVAL = 5  # seconds between process checks
 MAX_CONCURRENT = 2  # max simultaneous tasks
 STALL_TIMEOUT = 600  # seconds of no log output before considering task stalled
+NOTIFY_CHANNEL = os.environ.get("TASKD_NOTIFY_CHANNEL", "telegram")
+NOTIFY_RECIPIENT = os.environ.get("TASKD_NOTIFY_RECIPIENT", "")
 DEFAULT_MEDIA_DIR = Path("/media/media")
 
 # Video extensions to count for progress
@@ -206,11 +212,11 @@ class TaskState:
         return sum(1 for t in self.tasks.values() if t.status == TaskStatus.ACTIVE)
 
     def purge(self):
-        """Remove completed/cancelled tasks older than 1 day"""
+        """Remove completed/cancelled/failed tasks older than 1 day"""
         cutoff = datetime.now(timezone.utc).timestamp() - 86400
         to_remove = []
         for tid, t in self.tasks.items():
-            if t.status in (TaskStatus.COMPLETED, TaskStatus.CANCELLED):
+            if t.status in (TaskStatus.COMPLETED, TaskStatus.CANCELLED, TaskStatus.FAILED):
                 try:
                     ts = datetime.fromisoformat(t.finished_at).timestamp()
                     if ts < cutoff:
@@ -274,13 +280,48 @@ class TaskRunner:
             del self._log_writers[task.id]
             return False
 
+    def _notify(self, task: Task, status: str):
+        """Send notification via zeroclaw channel when a task completes or fails"""
+        if not NOTIFY_RECIPIENT:
+            return
+        icon = "✅" if status == "completed" else "❌"
+        msg = f"{icon} taskd: '{task.name}' {status}"
+        try:
+            subprocess.Popen(
+                ["zeroclaw", "channel", "send", msg,
+                 "--channel-id", NOTIFY_CHANNEL, "--recipient", NOTIFY_RECIPIENT],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception:
+            pass  # notification is best-effort
+
     def _build_command(self, task: Task) -> Optional[list[str]]:
         if task.type == "ani-cli":
             return self._build_anicli(task)
+        elif task.type == "claude":
+            return self._build_claude(task)
         elif task.type == "shell":
-            return ["bash", "-c", " ".join(task.args)]
+            return ["bash", "-c", shlex.join(task.args)]
         else:
             return None
+
+    def _build_claude(self, task: Task) -> list[str]:
+        """Build Claude Code task. Args are the prompt text (joined with spaces).
+        Writes prompt to bridge input, runs claude, captures output."""
+        prompt = " ".join(task.args) if task.args else task.name
+        bridge_dir = Path.home() / ".zeroclaw/workspace/claude-code-bridge"
+        bridge_dir.mkdir(parents=True, exist_ok=True)
+        input_file = bridge_dir / "input.md"
+        output_file = bridge_dir / "output.md"
+        input_file.write_text(prompt)
+        return [
+            "bash", "-c",
+            f"claude --dangerously-skip-permissions --allow-dangerously-skip-permissions "
+            f"--print -p - < {shlex.quote(str(input_file))} "
+            f"> {shlex.quote(str(output_file))} 2>&1"
+        ]
 
     def _build_anicli(self, task: Task) -> list[str]:
         """Build ani-cli download command.
@@ -393,6 +434,7 @@ class TaskRunner:
                     task.progress_pct = 100
                     task.progress_detail = "Done"
                     task.progress = "Done"
+                    self._notify(task, "completed")
                 else:
                     task.status = TaskStatus.FAILED
                     task.error = f"Exit code {ret}"
@@ -401,6 +443,8 @@ class TaskRunner:
                         task.retry_count += 1
                         task.status = TaskStatus.QUEUED
                         task.error = f"Auto-retry {task.retry_count}/{task.max_retries}"
+                    else:
+                        self._notify(task, "failed")
 
                 self.state.update(task)
 
