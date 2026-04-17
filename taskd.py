@@ -311,7 +311,7 @@ class TaskRunner:
         elif task.type == "rd":
             return self._build_rd(task)
         elif task.type == "shell":
-            return ["bash", "-c", shlex.join(task.args)]
+            return ["bash", "-c", " ".join(task.args)]
         else:
             return None
 
