@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-taskd — Lightweight task runner daemon for natasha-pi
+taskd — Lightweight task runner daemon (Hermes)
 
 Manages long-running tasks (downloads, scripts, etc.) outside of AI session limits.
 Runs as a systemd service, persists state to JSON, provides CLI + HTTP API.
@@ -18,13 +18,13 @@ Usage:
 Task types:
     ani-cli:  ani-cli anime downloads (args: "Anime Name" -S <n> -e "1-12")
               --dub is ALWAYS added automatically
-    claude:   delegate to Claude Code (args: the prompt text)
-              e.g. taskd add claude "Weather check" What is the weather in Tbilisi tomorrow?
-              Handles bridge files, permissions, and output capture automatically.
+    rd:       Real-Debrid download automation (args: <torrent_id> <file_ids> <dest_dir>)
+              Polls until files ready, selects, downloads, verifies with ffmpeg.
     shell:    arbitrary shell command (args: everything after name)
 
 Progress tracking:
     - ani-cli: parses episode range from -e flag, counts completed files + log output
+    - rd:      tracks multi-step pipeline (6 steps: poll, select, wait, download, verify, done)
     - shell:   tracks exit code + last log line
     - taskd status: shows progress bars with percentages
     - taskd show <id>: full progress detail + speed info
@@ -52,7 +52,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Optional
 
 # --- Config ---
-STATE_DIR = Path(os.environ.get("TASKD_DIR", os.path.expanduser("~/.zeroclaw/taskd")))
+STATE_DIR = Path(os.environ.get("TASKD_DIR", os.path.expanduser("~/.hermes/taskd")))
 STATE_FILE = STATE_DIR / "state.json"
 LOG_DIR = STATE_DIR / "logs"
 PID_FILE = STATE_DIR / "taskd.pid"
@@ -63,7 +63,7 @@ STALL_TIMEOUT = 3600  # seconds of no log output before considering task stalled
 NOTIFY_TG_TOKEN = os.environ.get("TASKD_TG_BOT_TOKEN", "")
 NOTIFY_TG_CHAT = os.environ.get("TASKD_TG_CHAT_ID", "")
 DEFAULT_MEDIA_DIR = Path("/media/media")
-CLAUDE_BRIDGE_DIR = Path.home() / ".zeroclaw/workspace/claude-code-bridge"
+RD_CLI = "/home/nikos/bin/rd"
 
 # Video extensions to count for progress
 VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".webm", ".ts"}
@@ -71,7 +71,6 @@ VIDEO_EXTS = {".mkv", ".mp4", ".avi", ".webm", ".ts"}
 # Ensure dirs exist
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
-CLAUDE_BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class TaskStatus(str, Enum):
@@ -86,7 +85,7 @@ class TaskStatus(str, Enum):
 @dataclass
 class Task:
     id: str
-    type: str  # "ani-cli", "shell"
+    type: str  # "ani-cli", "rd", "shell"
     name: str
     args: list = field(default_factory=list)
     status: str = TaskStatus.QUEUED
@@ -284,21 +283,11 @@ class TaskRunner:
             return False
 
     def _notify(self, task: Task, status: str):
-        """Send task result to Telegram and trigger Natasha via webhook"""
+        """Send task result to Telegram"""
         if not NOTIFY_TG_TOKEN or not NOTIFY_TG_CHAT:
             return
         icon = "✅" if status == "completed" else "❌"
-
-        # For claude tasks, send the output directly to Telegram
-        if task.type == "claude" and status == "completed":
-            output_file = CLAUDE_BRIDGE_DIR / "output.md"
-            try:
-                result = output_file.read_text().strip()
-                tg_msg = f"{icon} *Claude Code: {task.name}*\n\n{result}"
-            except Exception:
-                tg_msg = f"{icon} taskd: '{task.name}' {status} (couldn't read output)"
-        else:
-            tg_msg = f"{icon} taskd: '{task.name}' {status}"
+        tg_msg = f"{icon} taskd: '{task.name}' {status}"
 
         # Send directly via Telegram Bot API
         if NOTIFY_TG_TOKEN and NOTIFY_TG_CHAT:
@@ -319,25 +308,132 @@ class TaskRunner:
     def _build_command(self, task: Task) -> Optional[list[str]]:
         if task.type == "ani-cli":
             return self._build_anicli(task)
-        elif task.type == "claude":
-            return self._build_claude(task)
+        elif task.type == "rd":
+            return self._build_rd(task)
         elif task.type == "shell":
             return ["bash", "-c", shlex.join(task.args)]
         else:
             return None
 
-    def _build_claude(self, task: Task) -> list[str]:
-        """Build Claude Code task. Args are the prompt text (joined with spaces)."""
-        prompt = " ".join(task.args) if task.args else task.name
-        input_file = CLAUDE_BRIDGE_DIR / "input.md"
-        output_file = CLAUDE_BRIDGE_DIR / "output.md"
-        input_file.write_text(prompt)
-        return [
-            "bash", "-c",
-            f"claude --dangerously-skip-permissions --allow-dangerously-skip-permissions "
-            f"--print -p - < {shlex.quote(str(input_file))} "
-            f"> {shlex.quote(str(output_file))} 2>&1"
-        ]
+    def _build_rd(self, task: Task) -> list[str]:
+        """Build Real-Debrid download pipeline.
+
+        Args: <torrent_id> <file_ids> <dest_dir>
+        Generates a bash script that orchestrates the multi-step pipeline:
+          1. Poll 'rd files' until selected files are Ready
+          2. Run 'rd select' to select files
+          3. Wait for download links (poll 'rd downloads')
+          4. Run 'rd get' to download
+          5. Verify downloaded files with ffmpeg
+          6. Report success
+        """
+        if len(task.args) < 3:
+            task.error = "rd requires args: <torrent_id> <file_ids> <dest_dir>"
+            return None
+
+        torrent_id = task.args[0]
+        file_ids = task.args[1]
+        dest_dir = task.args[2]
+        task.download_dir = dest_dir
+        rd = shlex.quote(RD_CLI)
+
+        script = f"""#!/bin/bash
+set -euo pipefail
+
+TORRENT_ID={shlex.quote(torrent_id)}
+FILE_IDS={shlex.quote(file_ids)}
+DEST_DIR={shlex.quote(dest_dir)}
+
+mkdir -p "$DEST_DIR"
+
+echo "STEP 1/6: Polling rd files until selected files are ready..."
+MAX_POLL=120  # 120 * 30s = 1 hour max
+for i in $(seq 1 $MAX_POLL); do
+    OUTPUT=$({rd} files "$TORRENT_ID" 2>&1) || true
+    echo "$OUTPUT"
+
+    # Check if all selected files show Ready or Downloaded status
+    ALL_READY=true
+    IFS=',' read -ra IDS <<< "$FILE_IDS"
+    for fid in "${{IDS[@]}}"; do
+        # Look for the file ID line and check its status
+        if echo "$OUTPUT" | grep -qE "^\\s*$fid\\b.*\\b(Ready|Downloaded)\\b"; then
+            :
+        else
+            ALL_READY=false
+            break
+        fi
+    done
+
+    if [ "$ALL_READY" = true ]; then
+        echo "All selected files are ready."
+        break
+    fi
+
+    if [ "$i" -eq "$MAX_POLL" ]; then
+        echo "ERROR: Timed out waiting for files to become ready"
+        exit 1
+    fi
+
+    echo "Files not ready yet, waiting 30s... (attempt $i/$MAX_POLL)"
+    sleep 30
+done
+
+echo "STEP 2/6: Selecting files..."
+{rd} select "$TORRENT_ID" "$FILE_IDS"
+echo "Files selected."
+
+echo "STEP 3/6: Waiting for download links..."
+MAX_LINK_POLL=30  # 30 * 10s = 5 min
+for i in $(seq 1 $MAX_LINK_POLL); do
+    DOWNLOADS=$({rd} downloads 2>&1) || true
+    echo "$DOWNLOADS"
+
+    # Check if any download links are available for our torrent
+    if echo "$DOWNLOADS" | grep -qi "$TORRENT_ID\\|{shlex.quote(task.name.split()[0])}"; then
+        echo "Download links available."
+        break
+    fi
+
+    if [ "$i" -eq "$MAX_LINK_POLL" ]; then
+        echo "ERROR: Timed out waiting for download links"
+        exit 1
+    fi
+
+    echo "No download links yet, waiting 10s... (attempt $i/$MAX_LINK_POLL)"
+    sleep 10
+done
+
+echo "STEP 4/6: Downloading files..."
+{rd} get "$DEST_DIR" --ids "$FILE_IDS"
+echo "Download complete."
+
+echo "STEP 5/6: Verifying downloaded files with ffmpeg..."
+VERIFY_FAILED=0
+for f in "$DEST_DIR"/*.mkv "$DEST_DIR"/*.mp4 "$DEST_DIR"/*.avi "$DEST_DIR"/*.webm; do
+    [ -f "$f" ] || continue
+    echo "Verifying: $f"
+    if ffmpeg -v error -i "$f" -f null - 2>&1; then
+        echo "  OK: $f"
+    else
+        echo "  WARN: verification issues in $f"
+        VERIFY_FAILED=$((VERIFY_FAILED + 1))
+    fi
+done
+
+echo "STEP 6/6: Complete."
+if [ "$VERIFY_FAILED" -gt 0 ]; then
+    echo "WARNING: $VERIFY_FAILED file(s) had verification issues"
+else
+    echo "All files verified successfully."
+fi
+
+echo "Files saved to: $DEST_DIR"
+ls -lh "$DEST_DIR"
+"""
+
+        task.total_items = 6  # 6 pipeline steps
+        return ["bash", "-c", script]
 
     def _build_anicli(self, task: Task) -> list[str]:
         """Build ani-cli download command.
@@ -474,6 +570,8 @@ class TaskRunner:
         """Update progress for a task based on its type"""
         if task.type == "ani-cli":
             self._update_anicli_progress(task)
+        elif task.type == "rd":
+            self._update_rd_progress(task)
         elif task.type == "shell":
             self._update_shell_progress(task)
 
@@ -543,6 +641,42 @@ class TaskRunner:
                         break
             except:
                 pass
+
+    def _update_rd_progress(self, task: Task):
+        """Track rd pipeline progress via STEP N/6 markers in logs"""
+        log_path = Path(task.log_file)
+        if not log_path.exists():
+            return
+
+        step_labels = {
+            1: "Polling files",
+            2: "Selecting files",
+            3: "Waiting for links",
+            4: "Downloading",
+            5: "Verifying",
+            6: "Complete",
+        }
+
+        try:
+            content = log_path.read_text()
+            # Find the highest STEP marker
+            steps = re.findall(r'STEP (\d)/6:', content)
+            if steps:
+                current_step = max(int(s) for s in steps)
+                task.completed_items = current_step
+                task.progress_pct = min(99, int((current_step / 6) * 100))
+                label = step_labels.get(current_step, f"Step {current_step}")
+                task.progress_detail = f"Step {current_step}/6: {label}"
+
+            # Grab last meaningful log line
+            lines = content.strip().split('\n')
+            for line in reversed(lines):
+                line = line.strip()
+                if line and len(line) > 3:
+                    task.progress = line[-120:]
+                    break
+        except Exception:
+            pass
 
     def _update_shell_progress(self, task: Task):
         """Track shell task progress via last log line"""
@@ -677,10 +811,11 @@ class TaskAPIHandler(http.server.BaseHTTPRequestHandler):
                 args=body.get("args", []),
                 priority=body.get("priority", 0),
             )
-            # Auto-set download_dir for ani-cli
+            # Run build to set side effects (download_dir, total_items)
             if task.type == "ani-cli":
-                cmd = self.runner._build_anicli(task)
-                # _build_anicli sets task.download_dir and task.total_items as side effects
+                self.runner._build_anicli(task)
+            elif task.type == "rd":
+                self.runner._build_rd(task)
             self.state.add(task)
             self._json_response(asdict(task), 201)
         else:
@@ -1062,12 +1197,12 @@ def main():
     elif cmd == "add":
         if len(sys.argv) < 4:
             print("Usage: taskd add <type> <name> [args...]")
-            print("  type: ani-cli | shell")
+            print("  type: ani-cli | rd | shell")
             print("  Note: --dub is ALWAYS added for ani-cli tasks")
             print("  Examples:")
             print('    taskd add ani-cli "Chained Soldier S2" "Chained Soldier" -S 1 -e "6-12"')
+            print('    taskd add rd "Movie Name (2026)" TORRENT_ID 1,2,3 /media/media/Movie/')
             print('    taskd add shell "Sync Obsidian" rsync -av ~/todos/ /backup/todos/')
-            print('    taskd add ani-cli "Frieren S2" "Frieren" -S 2 -e "1-28" -p 5')
             sys.exit(1)
 
         task_type = sys.argv[2]
@@ -1106,13 +1241,16 @@ def main():
         except:
             # Daemon not running — add directly to state
             state = TaskState()
-            # Run _build_anicli to set download_dir and total_items
             runner = TaskRunner(state)
-            runner._build_anicli(task)
+            # Run build to set side effects (download_dir, total_items)
+            if task.type == "ani-cli":
+                runner._build_anicli(task)
+            elif task.type == "rd":
+                runner._build_rd(task)
             state.add(task)
             pct_info = ""
             if task.total_items:
-                pct_info = f"  ({task.total_items} episodes)"
+                pct_info = f"  ({task.total_items} items)"
             print(f"Added task (offline): {task.id}  {name}  [{task.status}]{pct_info}")
             print("Note: daemon not running. Start with: taskd start")
 
